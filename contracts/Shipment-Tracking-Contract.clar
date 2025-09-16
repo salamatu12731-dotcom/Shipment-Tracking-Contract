@@ -5,8 +5,17 @@
 (define-constant err-invalid-status (err u103))
 (define-constant err-shipment-exists (err u104))
 (define-constant err-invalid-participant (err u105))
+(define-constant err-insufficient-funds (err u106))
+(define-constant err-escrow-not-funded (err u107))
+(define-constant err-insurance-required (err u108))
+(define-constant err-claim-already-exists (err u109))
+(define-constant err-claim-not-found (err u110))
+(define-constant err-invalid-claim-status (err u111))
 
 (define-data-var next-shipment-id uint u1)
+(define-data-var next-claim-id uint u1)
+(define-data-var platform-fee-rate uint u250)
+(define-data-var insurance-rate uint u500)
 
 (define-map shipments
     { shipment-id: uint }
@@ -24,6 +33,9 @@
         value: uint,
         weight: uint,
         tracking-hash: (string-ascii 64),
+        escrow-amount: uint,
+        insurance-amount: uint,
+        requires-insurance: bool,
     }
 )
 
@@ -60,6 +72,44 @@
         shipment-id: uint,
     }
     { role: (string-ascii 10) }
+)
+
+(define-map escrow-balances
+    { shipment-id: uint }
+    {
+        amount: uint,
+        released: bool,
+        release-block: (optional uint),
+    }
+)
+
+(define-map insurance-policies
+    { shipment-id: uint }
+    {
+        premium-paid: uint,
+        coverage-amount: uint,
+        active: bool,
+        policy-holder: principal,
+    }
+)
+
+(define-map insurance-claims
+    { claim-id: uint }
+    {
+        shipment-id: uint,
+        claimant: principal,
+        amount-claimed: uint,
+        reason: (string-ascii 200),
+        status: (string-ascii 20),
+        filed-at: uint,
+        resolved-at: (optional uint),
+        approved-amount: uint,
+    }
+)
+
+(define-map shipment-claims
+    { shipment-id: uint }
+    { claim-id: (optional uint) }
 )
 
 (define-read-only (get-shipment (shipment-id uint))
@@ -149,13 +199,35 @@
         (value uint)
         (weight uint)
         (tracking-hash (string-ascii 64))
+        (escrow-amount uint)
+        (requires-insurance bool)
     )
     (let (
             (shipment-id (var-get next-shipment-id))
             (current-block stacks-block-height)
+            (insurance-amount (if requires-insurance
+                (/ (* value (var-get insurance-rate)) u10000)
+                u0
+            ))
+            (total-payment (+ escrow-amount insurance-amount))
         )
         (asserts! (is-authorized-carrier carrier) err-unauthorized)
         (asserts! (> estimated-delivery current-block) err-invalid-status)
+        (asserts! (>= (stx-get-balance tx-sender) total-payment)
+            err-insufficient-funds
+        )
+        (asserts! (> escrow-amount u0) err-escrow-not-funded)
+        (asserts! (or (not requires-insurance) (> insurance-amount u0))
+            err-insurance-required
+        )
+
+        (if (> total-payment u0)
+            (unwrap!
+                (stx-transfer? total-payment tx-sender (as-contract tx-sender))
+                (err u999)
+            )
+            true
+        )
 
         (map-set shipments { shipment-id: shipment-id } {
             sender: tx-sender,
@@ -171,7 +243,26 @@
             value: value,
             weight: weight,
             tracking-hash: tracking-hash,
+            escrow-amount: escrow-amount,
+            insurance-amount: insurance-amount,
+            requires-insurance: requires-insurance,
         })
+
+        (map-set escrow-balances { shipment-id: shipment-id } {
+            amount: escrow-amount,
+            released: false,
+            release-block: none,
+        })
+
+        (if requires-insurance
+            (map-set insurance-policies { shipment-id: shipment-id } {
+                premium-paid: insurance-amount,
+                coverage-amount: value,
+                active: true,
+                policy-holder: tx-sender,
+            })
+            true
+        )
 
         (map-set user-shipments {
             user: tx-sender,
@@ -265,6 +356,7 @@
         (is-eq status "delivered")
         (is-eq status "exception")
         (is-eq status "returned")
+        (is-eq status "cancelled")
     )
 )
 
@@ -334,10 +426,42 @@
 )
 
 (define-public (confirm-delivery (shipment-id uint))
-    (let ((shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) err-not-found)))
+    (let (
+            (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id })
+                err-not-found
+            ))
+            (escrow-data (unwrap! (map-get? escrow-balances { shipment-id: shipment-id })
+                err-not-found
+            ))
+        )
         (asserts! (is-eq tx-sender (get receiver shipment)) err-unauthorized)
         (asserts! (is-eq (get status shipment) "delivered") err-invalid-status)
-        (ok true)
+        (asserts! (not (get released escrow-data)) err-invalid-status)
+
+        (let (
+                (escrow-amount (get amount escrow-data))
+                (platform-fee (/ (* escrow-amount (var-get platform-fee-rate)) u10000))
+                (carrier-payment (- escrow-amount platform-fee))
+            )
+            (if (> carrier-payment u0)
+                (unwrap!
+                    (as-contract (stx-transfer? carrier-payment tx-sender
+                        (get carrier shipment)
+                    ))
+                    (err u999)
+                )
+                true
+            )
+
+            (map-set escrow-balances { shipment-id: shipment-id }
+                (merge escrow-data {
+                    released: true,
+                    release-block: (some stacks-block-height),
+                })
+            )
+
+            (ok true)
+        )
     )
 )
 
@@ -345,9 +469,9 @@
     (filter get-sender-shipments
         (list
             u1             u2             u3             u4             u5
-                        u6             u7             u8             u9             u10
-                        u11             u12             u13             u14             u15
-                        u16             u17             u18             u19
+            u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+            u16             u17             u18             u19
             u20
         ))
 )
@@ -356,9 +480,9 @@
     (filter get-receiver-shipments
         (list
             u1             u2             u3             u4             u5
-                        u6             u7             u8             u9             u10
-                        u11             u12             u13             u14             u15
-                        u16             u17             u18             u19
+            u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+            u16             u17             u18             u19
             u20
         ))
 )
@@ -367,9 +491,9 @@
     (filter get-carrier-shipments
         (list
             u1             u2             u3             u4             u5
-                        u6             u7             u8             u9             u10
-                        u11             u12             u13             u14             u15
-                        u16             u17             u18             u19
+            u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+            u16             u17             u18             u19
             u20
         ))
 )
@@ -506,10 +630,10 @@
         (fold count-active-shipments
             (list
                 u1                 u2                 u3                 u4
-                                u5                 u6                 u7                 u8
-                                u9                 u10                 u11                 u12
-                                u13                 u14                 u15                 u16
-                                u17                 u18
+                u5                 u6                 u7                 u8
+                u9                 u10                 u11                 u12
+                u13                 u14                 u15                 u16
+                u17                 u18
                 u19                 u20
             )
             u0
@@ -538,11 +662,11 @@
             (total-shipments (fold count-carrier-shipments
                 (list
                     u1                     u2                     u3
-                                        u4                     u5                     u6
-                                        u7                     u8                     u9
-                                        u10                     u11                     u12
-                                        u13                     u14                     u15
-                                        u16                     u17
+                    u4                     u5                     u6
+                    u7                     u8                     u9
+                    u10                     u11                     u12
+                    u13                     u14                     u15
+                    u16                     u17
                     u18                     u19                     u20
                 )
                 u0
@@ -550,11 +674,11 @@
             (delivered-on-time (fold count-on-time-deliveries
                 (list
                     u1                     u2                     u3
-                                        u4                     u5                     u6
-                                        u7                     u8                     u9
-                                        u10                     u11                     u12
-                                        u13                     u14                     u15
-                                        u16                     u17
+                    u4                     u5                     u6
+                    u7                     u8                     u9
+                    u10                     u11                     u12
+                    u13                     u14                     u15
+                    u16                     u17
                     u18                     u19                     u20
                 )
                 u0
@@ -613,5 +737,212 @@
             shipment: shipment,
             updates: updates,
         }
+    )
+)
+
+(define-public (file-insurance-claim
+        (shipment-id uint)
+        (amount-claimed uint)
+        (reason (string-ascii 200))
+    )
+    (let (
+            (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id })
+                err-not-found
+            ))
+            (policy (unwrap! (map-get? insurance-policies { shipment-id: shipment-id })
+                err-not-found
+            ))
+            (claim-id (var-get next-claim-id))
+            (existing-claim (map-get? shipment-claims { shipment-id: shipment-id }))
+        )
+        (asserts! (is-eq tx-sender (get policy-holder policy)) err-unauthorized)
+        (asserts! (get active policy) err-invalid-status)
+        (asserts! (<= amount-claimed (get coverage-amount policy))
+            err-invalid-status
+        )
+        (asserts! (is-none (get claim-id existing-claim))
+            err-claim-already-exists
+        )
+        (asserts! (not (is-eq (get status shipment) "delivered"))
+            err-invalid-status
+        )
+
+        (map-set insurance-claims { claim-id: claim-id } {
+            shipment-id: shipment-id,
+            claimant: tx-sender,
+            amount-claimed: amount-claimed,
+            reason: reason,
+            status: "pending",
+            filed-at: stacks-block-height,
+            resolved-at: none,
+            approved-amount: u0,
+        })
+
+        (map-set shipment-claims { shipment-id: shipment-id } { claim-id: (some claim-id) })
+        (var-set next-claim-id (+ claim-id u1))
+
+        (ok claim-id)
+    )
+)
+
+(define-public (process-insurance-claim
+        (claim-id uint)
+        (approved bool)
+        (approved-amount uint)
+    )
+    (let (
+            (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id })
+                err-claim-not-found
+            ))
+            (shipment-id (get shipment-id claim))
+            (policy (unwrap! (map-get? insurance-policies { shipment-id: shipment-id })
+                err-not-found
+            ))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-eq (get status claim) "pending") err-invalid-claim-status)
+        (asserts! (<= approved-amount (get amount-claimed claim))
+            err-invalid-status
+        )
+
+        (let ((new-status (if approved
+                "approved"
+                "rejected"
+            )))
+            (map-set insurance-claims { claim-id: claim-id }
+                (merge claim {
+                    status: new-status,
+                    resolved-at: (some stacks-block-height),
+                    approved-amount: approved-amount,
+                })
+            )
+
+            (if (and approved (> approved-amount u0))
+                (begin
+                    (unwrap!
+                        (as-contract (stx-transfer? approved-amount tx-sender
+                            (get claimant claim)
+                        ))
+                        (err u999)
+                    )
+                    (map-set insurance-policies { shipment-id: shipment-id }
+                        (merge policy { active: false })
+                    )
+                )
+                true
+            )
+
+            (ok new-status)
+        )
+    )
+)
+
+(define-public (refund-escrow (shipment-id uint))
+    (let (
+            (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id })
+                err-not-found
+            ))
+            (escrow-data (unwrap! (map-get? escrow-balances { shipment-id: shipment-id })
+                err-not-found
+            ))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get sender shipment))
+                (is-eq tx-sender contract-owner)
+            )
+            err-unauthorized
+        )
+        (asserts! (not (get released escrow-data)) err-invalid-status)
+        (asserts!
+            (or
+                (is-eq (get status shipment) "cancelled")
+                (> stacks-block-height (+ (get estimated-delivery shipment) u144))
+            )
+            err-invalid-status
+        )
+
+        (let ((refund-amount (get amount escrow-data)))
+            (unwrap!
+                (as-contract (stx-transfer? refund-amount tx-sender (get sender shipment)))
+                (err u999)
+            )
+
+            (map-set escrow-balances { shipment-id: shipment-id }
+                (merge escrow-data {
+                    released: true,
+                    release-block: (some stacks-block-height),
+                })
+            )
+
+            (ok refund-amount)
+        )
+    )
+)
+
+(define-read-only (get-escrow-status (shipment-id uint))
+    (map-get? escrow-balances { shipment-id: shipment-id })
+)
+
+(define-read-only (get-insurance-policy (shipment-id uint))
+    (map-get? insurance-policies { shipment-id: shipment-id })
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+    (map-get? insurance-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-shipment-claim (shipment-id uint))
+    (map-get? shipment-claims { shipment-id: shipment-id })
+)
+
+(define-read-only (calculate-insurance-premium (shipment-value uint))
+    (/ (* shipment-value (var-get insurance-rate)) u10000)
+)
+
+(define-read-only (calculate-platform-fee (escrow-amount uint))
+    (/ (* escrow-amount (var-get platform-fee-rate)) u10000)
+)
+
+(define-public (update-platform-fee-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-rate u1000) err-invalid-status)
+        (var-set platform-fee-rate new-rate)
+        (ok new-rate)
+    )
+)
+
+(define-public (update-insurance-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-rate u2000) err-invalid-status)
+        (var-set insurance-rate new-rate)
+        (ok new-rate)
+    )
+)
+
+(define-read-only (get-total-escrow-locked)
+    (fold calculate-total-escrow
+        (list
+            u1             u2             u3             u4             u5
+                        u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+                        u16             u17             u18             u19             u20
+        )
+        u0
+    )
+)
+
+(define-private (calculate-total-escrow
+        (shipment-id uint)
+        (acc uint)
+    )
+    (match (map-get? escrow-balances { shipment-id: shipment-id })
+        escrow-data (if (not (get released escrow-data))
+            (+ acc (get amount escrow-data))
+            acc
+        )
+        acc
     )
 )
