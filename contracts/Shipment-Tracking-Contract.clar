@@ -11,9 +11,13 @@
 (define-constant err-claim-already-exists (err u109))
 (define-constant err-claim-not-found (err u110))
 (define-constant err-invalid-claim-status (err u111))
+(define-constant err-invalid-rating (err u112))
+(define-constant err-rating-already-exists (err u113))
+(define-constant err-invalid-rated-user (err u114))
 
 (define-data-var next-shipment-id uint u1)
 (define-data-var next-claim-id uint u1)
+(define-data-var next-rating-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var insurance-rate uint u500)
 
@@ -110,6 +114,70 @@
 (define-map shipment-claims
     { shipment-id: uint }
     { claim-id: (optional uint) }
+)
+
+(define-map ratings
+    { rating-id: uint }
+    {
+        shipment-id: uint,
+        rater: principal,
+        rated-user: principal,
+        score: uint,
+        timestamp: uint,
+    }
+)
+
+(define-map rating-totals
+    { user: principal }
+    { total-score: uint }
+)
+
+(define-map rating-counts
+    { user: principal }
+    { count: uint }
+)
+
+(define-map user-ratings
+    {
+        shipment-id: uint,
+        rater: principal,
+    }
+    { rating-id: uint }
+)
+
+(define-read-only (get-user-average-rating (user principal))
+    (let (
+            (total (default-to u0
+                (get total-score (map-get? rating-totals { user: user }))
+            ))
+            (count (default-to u0 (get count (map-get? rating-counts { user: user }))))
+        )
+        (if (> count u0)
+            (/ total count)
+            u0
+        )
+    )
+)
+
+(define-read-only (get-user-rating-count (user principal))
+    (default-to u0 (get count (map-get? rating-counts { user: user })))
+)
+
+(define-read-only (get-rating-by-id (rating-id uint))
+    (map-get? ratings { rating-id: rating-id })
+)
+
+(define-read-only (get-shipment-rating
+        (shipment-id uint)
+        (rater principal)
+    )
+    (match (map-get? user-ratings {
+        shipment-id: shipment-id,
+        rater: rater,
+    })
+        rating-record (map-get? ratings { rating-id: (get rating-id rating-record) })
+        none
+    )
 )
 
 (define-read-only (get-shipment (shipment-id uint))
@@ -926,9 +994,9 @@
     (fold calculate-total-escrow
         (list
             u1             u2             u3             u4             u5
-                        u6             u7             u8             u9             u10
+            u6             u7             u8             u9             u10
             u11             u12             u13             u14             u15
-                        u16             u17             u18             u19             u20
+            u16             u17             u18             u19             u20
         )
         u0
     )
@@ -944,5 +1012,63 @@
             acc
         )
         acc
+    )
+)
+
+(define-public (submit-rating
+        (shipment-id uint)
+        (rated-user principal)
+        (score uint)
+    )
+    (let (
+            (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id })
+                err-not-found
+            ))
+            (rating-id (var-get next-rating-id))
+            (existing-rating (map-get? user-ratings {
+                shipment-id: shipment-id,
+                rater: tx-sender,
+            }))
+            (current-total (default-to u0
+                (get total-score (map-get? rating-totals { user: rated-user }))
+            ))
+            (current-count (default-to u0
+                (get count (map-get? rating-counts { user: rated-user }))
+            ))
+        )
+        (asserts! (is-eq (get status shipment) "delivered") err-invalid-status)
+        (asserts!
+            (or (is-eq tx-sender (get sender shipment)) (is-eq tx-sender (get receiver shipment)))
+            err-unauthorized
+        )
+        (asserts! (not (is-eq tx-sender rated-user)) err-invalid-rated-user)
+        (asserts! (and (>= score u1) (<= score u5)) err-invalid-rating)
+        (asserts! (is-none existing-rating) err-rating-already-exists)
+        (asserts!
+            (or (is-eq rated-user (get receiver shipment)) (is-eq rated-user (get carrier shipment)))
+            err-invalid-rated-user
+        )
+
+        (map-set ratings { rating-id: rating-id } {
+            shipment-id: shipment-id,
+            rater: tx-sender,
+            rated-user: rated-user,
+            score: score,
+            timestamp: stacks-block-height,
+        })
+
+        (map-set user-ratings {
+            shipment-id: shipment-id,
+            rater: tx-sender,
+        } { rating-id: rating-id }
+        )
+
+        (map-set rating-totals { user: rated-user } { total-score: (+ current-total score) })
+
+        (map-set rating-counts { user: rated-user } { count: (+ current-count u1) })
+
+        (var-set next-rating-id (+ rating-id u1))
+
+        (ok rating-id)
     )
 )
