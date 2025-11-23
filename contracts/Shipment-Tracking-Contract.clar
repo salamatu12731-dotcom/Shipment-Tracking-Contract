@@ -20,6 +20,8 @@
 (define-data-var next-rating-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var insurance-rate uint u500)
+(define-data-var platform-fees-accrued uint u0)
+(define-data-var fee-recipient principal contract-owner)
 
 (define-map shipments
     { shipment-id: uint }
@@ -521,6 +523,10 @@
                 true
             )
 
+            (var-set platform-fees-accrued
+                (+ (var-get platform-fees-accrued) platform-fee)
+            )
+
             (map-set escrow-balances { shipment-id: shipment-id }
                 (merge escrow-data {
                     released: true,
@@ -529,6 +535,36 @@
             )
 
             (ok true)
+        )
+    )
+)
+
+(define-read-only (get-platform-fees-accrued)
+    (var-get platform-fees-accrued)
+)
+
+(define-public (set-fee-recipient (recipient principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set fee-recipient recipient)
+        (ok recipient)
+    )
+)
+
+(define-public (withdraw-platform-fees (amount uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (let (
+                (accrued (var-get platform-fees-accrued))
+                (recipient (var-get fee-recipient))
+            )
+            (asserts! (> amount u0) err-invalid-status)
+            (asserts! (<= amount accrued) err-insufficient-funds)
+            (unwrap! (as-contract (stx-transfer? amount tx-sender recipient))
+                (err u999)
+            )
+            (var-set platform-fees-accrued (- accrued amount))
+            (ok amount)
         )
     )
 )
